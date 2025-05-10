@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "SyslogSharp": {
+      "commandName": "Project",
+      "commandLineArgs": "-v"
+    }
+  }
+}
