@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Logging;
 using System.Diagnostics.CodeAnalysis;
+using System.Collections.Concurrent;
 
 namespace SyslogSharp.Networking;
 
@@ -17,9 +18,10 @@ namespace SyslogSharp.Networking;
 internal abstract class UdpReceiver<T> : IDisposable
 {
     private Socket? _socket;
-    private SocketAsyncEventArgs? _receiveEventArgs;
     private bool _disposed;
-    private bool _receiving;
+    private ConcurrentQueue<SocketAsyncEventArgs>? _receiveDataProcessorsPool;
+    private readonly List<IDisposable> _disposables = [];
+    private readonly int _concurrentReceivers;
 
     /// <summary>
     /// Gets the endpoint on which the server is configured to listen for incoming connections.
@@ -55,10 +57,13 @@ internal abstract class UdpReceiver<T> : IDisposable
     /// specified endpoint. Ensure that the provided <paramref name="listenEndpoint"/> is valid and properly configured
     /// for UDP communication.</remarks>
     /// <param name="listenEndpoint">The <see cref="EndPoint"/> on which the receiver will listen for incoming UDP packets. Cannot be null.</param>
-    protected UdpReceiver(EndPoint listenEndpoint)
+    protected UdpReceiver(EndPoint listenEndpoint, int concurrentReceivers = 10)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(concurrentReceivers, 1);
+
         ListenProtocol = System.Net.Sockets.ProtocolType.Udp;
         ListenEndpoint = listenEndpoint;
+        _concurrentReceivers = concurrentReceivers;
     }
 
     /// <summary>
@@ -70,15 +75,23 @@ internal abstract class UdpReceiver<T> : IDisposable
     /// reinitializing.</remarks>
     public void Start()
     {
-        if (_socket != null || _receiveEventArgs != null)
+        if (_socket != null || _receiveDataProcessorsPool != null)
         {
             Logger.LogWarning("Start called on an already initialized receiver.");
             return;
         }
 
-        _receiveEventArgs = new SocketAsyncEventArgs();
-        _receiveEventArgs.SetBuffer(new byte[ushort.MaxValue], 0, ushort.MaxValue);
-        _receiveEventArgs.Completed += ReceiveCompletedHandler;
+        _receiveDataProcessorsPool = new ConcurrentQueue<SocketAsyncEventArgs>();
+        var eventArgsHandler = new EventHandler<SocketAsyncEventArgs>(ReceiveCompletedHandler);
+
+        for(var i = 0; i < _concurrentReceivers; i++)
+        {
+            var eventArgs = new SocketAsyncEventArgs();
+            eventArgs.SetBuffer(new byte[ushort.MaxValue], 0, ushort.MaxValue);
+            eventArgs.Completed += eventArgsHandler;
+            _receiveDataProcessorsPool.Enqueue(eventArgs);
+            _disposables.Add(eventArgs);
+        }
 
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Raw, System.Net.Sockets.ProtocolType.Udp)
         {
@@ -113,7 +126,6 @@ internal abstract class UdpReceiver<T> : IDisposable
 
     private void ProcessReceivedData(SocketAsyncEventArgs e)
     {
-        _receiving = false;
         if (_disposed)
             return;
 
@@ -130,26 +142,41 @@ internal abstract class UdpReceiver<T> : IDisposable
         }
 
         e.SetBuffer(0, ushort.MaxValue);
+        _receiveDataProcessorsPool?.Enqueue(e);
         ReceiveDataAndProcess();
     }
 
     private void ReceiveDataAndProcess()
     {
-        if (_receiving || _disposed)
+        if (_disposed)
             return;
 
-        if (_socket is null || _receiveEventArgs is null)
+        if (_socket is null || _receiveDataProcessorsPool is null)
         {
             Logger.LogError("Receiver not initialized correctly.");
             throw new InvalidOperationException("Receiver not initialized correctly.");
         }
 
-        _receiving = true;
+        if(_receiveDataProcessorsPool.TryDequeue(out var deqAsyncEvent))
+        {
+            if(deqAsyncEvent.Offset != 0 || deqAsyncEvent.Count != ushort.MaxValue)
+            {
+                deqAsyncEvent.SetBuffer(new byte[ushort.MaxValue], 0, ushort.MaxValue);
+            }
 
-        if (!_socket.ReceiveAsync(_receiveEventArgs))
-            ProcessReceivedData(_receiveEventArgs);
+            if(!_socket.ReceiveAsync(deqAsyncEvent))
+                ProcessReceivedData(deqAsyncEvent);
+        }
     }
 
+    /// <summary>
+    /// Releases the resources used by the server, including the underlying socket and any managed disposables.
+    /// </summary>
+    /// <remarks>This method should be called when the server is no longer needed to ensure proper cleanup of
+    /// resources. It shuts down the socket connection, disposes of managed resources, and logs the shutdown
+    /// process.</remarks>
+    /// <param name="disposing">A value indicating whether the method is being called explicitly to release both managed and unmanaged resources
+    /// (<see langword="true"/>), or by the finalizer to release only unmanaged resources (<see langword="false"/>).</param>
     protected virtual void Dispose(bool disposing)
     {
         if (_disposed)
@@ -173,8 +200,10 @@ internal abstract class UdpReceiver<T> : IDisposable
 
         try
         {
-            _receiveEventArgs?.Dispose();
-            _receiveEventArgs = null;
+            foreach(var disposable in _disposables)
+            {
+                disposable.Dispose();
+            }
         }
         catch
         {
