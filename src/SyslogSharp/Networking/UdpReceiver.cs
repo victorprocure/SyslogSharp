@@ -113,7 +113,7 @@ internal abstract class UdpReceiver<T> : IDisposable
     /// this method returns <see langword="false"/>, the value is <see langword="null"/>.</param>
     /// <returns><see langword="true"/> if the packet was successfully parsed and the data was extracted; otherwise, <see
     /// langword="false"/>.</returns>
-    protected abstract bool TryParsePacket(IpPacket packet, [NotNullWhen(true)] out T? data);
+    protected abstract bool TryParsePacket(TransportPacket packet, [NotNullWhen(true)] out T? data);
 
     private void ReceiveCompletedHandler(object? sender, SocketAsyncEventArgs e)
     {
@@ -136,7 +136,9 @@ internal abstract class UdpReceiver<T> : IDisposable
         }
 
         var ipPacket = PacketParser.Parse(DateTimeOffset.UtcNow, false, e.Buffer, 0);
-        if (e.SocketError == SocketError.Success && TryParsePacket(ipPacket, out var packet))
+        var payload = ipPacket.PayloadPacketOrData.Value.AsT0;
+
+        if (e.SocketError == SocketError.Success && payload is TransportPacket transportPacket && TryParsePacket(transportPacket, out var packet))
         {
             Received?.Invoke(this, packet!);
         }

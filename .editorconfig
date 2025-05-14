@@ -381,3 +381,6 @@ tab_width = 4
 indent_size = 4
 end_of_line = crlf
 
+dotnet_diagnostic.S1066.severity = none
+dotnet_diagnostic.S1135.severity = suggestion
+

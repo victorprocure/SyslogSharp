@@ -30,33 +30,18 @@ internal static class PacketParser
     /// <exception cref="NotSupportedException">Thrown if the IP version is not IPv4.</exception>
     public static IpPacket Parse(DateTimeOffset receivedTime, bool reuseBuffer, byte[]? packetBytes, int offset)
     {
-        ArgumentNullException.ThrowIfNull(packetBytes);
-
-        var ipVersion = (byte)(packetBytes[0] >> 4);
-        if(ipVersion != 4)
-            throw new NotSupportedException($"IP version {ipVersion} is not supported.");
-
-        var ipV4Packet = Ipv4Parser.Parse(receivedTime, reuseBuffer, packetBytes, offset);
-
-        return new()
+        if(packetBytes is null)
         {
-            PacketHeader = new(
-                ipV4Packet.SourceAddress,
-                ipV4Packet.DestinationAddress,
-                isIp6: false,
-                ipV4Packet.IHL,
-                ipV4Packet.DSCP,
-                ipV4Packet.ECN,
-                ipV4Packet.TotalLength,
-                ipV4Packet.Identification,
-                ipV4Packet.HeaderFlags,
-                ipV4Packet.FragmentOffset,
-                ipV4Packet.TTL,
-                ipV4Packet.HeaderChecksum),
-            ReceivedTime = receivedTime,
-            ProtocolType = ipV4Packet.Protocol,
-            IpOptions = ipV4Packet.Options,
-            PacketData = ipV4Packet.Payload
-        };
+            throw new ArgumentNullException(nameof(packetBytes), "Packet bytes cannot be null.");
+        }
+
+        var rawPacket = new RawIpPacket(new(packetBytes, offset, packetBytes.Length - offset));
+        if(rawPacket.PayloadPacketOrData.Value.AsT0 is IpPacket ipPacket)
+        {
+
+            return ipPacket;
+        }
+
+        throw new InvalidOperationException("Invalid packet data");
     }
 }

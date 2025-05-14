@@ -25,27 +25,39 @@ internal sealed class UdpServer : UdpReceiver<SyslogMessage>
         return Task.CompletedTask;
     }
 
-    protected override bool TryParsePacket(IpPacket packet, [NotNullWhen(true)] out SyslogMessage? data)
+    protected override bool TryParsePacket(TransportPacket packet, [NotNullWhen(true)] out SyslogMessage? data)
     {
         data = null;
-        if(ListenEndpoint is IPEndPoint ipEndpoint && ipEndpoint.Address != IPAddress.Any && !packet.PacketHeader.DestinationIpAddress.Equals(ipEndpoint.Address))
+        if (packet.Parent is not IpPacket parent)
         {
-            Logger.LogWarning("Received packet with destination IP {DestinationIp} but server is listening on {ListeningIp}", packet.PacketHeader.DestinationIpAddress, ipEndpoint.Address);
+            Logger.LogWarning("Received packet with no parent IP packet.");
             return false;
         }
 
-        var udpDatagram = ConvertToDatagram(packet, false);
-        var isValid = udpDatagram.UdpDatagramHeader?.DestinationPort == (ListenEndpoint as IPEndPoint)?.Port;
+        if (ListenEndpoint is IPEndPoint ipEndpoint && ipEndpoint.Address != IPAddress.Any && !parent.DestinationAddress.Equals(ipEndpoint.Address))
+        {
+            Logger.LogWarning("Received packet with destination IP {DestinationIp} but server is listening on {ListeningIp}", parent.DestinationAddress, ipEndpoint.Address);
+            return false;
+        }
+
+
+        var isValid = packet.DestinationPort == (ListenEndpoint as IPEndPoint)?.Port;
         if(!isValid)
         {
-            Logger.LogWarning("Received packet with destination port {DestinationPort} but server is listening on {ListeningPort}", udpDatagram.UdpDatagramHeader?.DestinationPort, (ListenEndpoint as IPEndPoint)?.Port);
+            Logger.LogWarning("Received packet with destination port {DestinationPort} but server is listening on {ListeningPort}", packet.DestinationPort, (ListenEndpoint as IPEndPoint)?.Port);
+            return false;
+        }
+
+        if(!packet.PayloadPacketOrData.Value.TryPickT1(out var udpData, out var _))
+        {
+            Logger.LogWarning("Received packet with invalid payload data.");
             return false;
         }
 
         SyslogEvent syslog;
         try
         {
-            syslog = _syslogEventParser.Parse(udpDatagram.UdpData, udpDatagram.ReceivedTime, udpDatagram.PacketHeader.SourceIpAddress.ToString());
+            syslog = _syslogEventParser.Parse(udpData, packet.ReceivedAt, parent.SourceAddress.ToString());
         }
         catch
         {
@@ -54,54 +66,12 @@ internal sealed class UdpServer : UdpReceiver<SyslogMessage>
 
         data = new()
         {
-            OccurrenceTime = packet.ReceivedTime,
-            ReceivedTime = packet.ReceivedTime,
-            Payload = udpDatagram.UdpData.Array,
+            OccurrenceTime = packet.ReceivedAt,
+            ReceivedTime = packet.ReceivedAt,
+            Payload = [.. udpData],
             PayloadInstance = syslog
         };
 
         return true;
-    }
-
-    private static UdpDatagram ConvertToDatagram(IpPacket ipPacket, bool reuseOriginalBuffer = true)
-    {
-        ArgumentNullException.ThrowIfNull(ipPacket);
-
-        if (ipPacket.ProtocolType != Networking.ProtocolType.UDP)
-        {
-            throw new NotSupportedException("Only UDP packets are supported.");
-        }
-
-        if (ipPacket.PacketData.Count <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(ipPacket), "IP Packet data not provided.");
-        }
-
-        var packetData = ParserHelpers.AsByteArraySegment(ipPacket.PacketData);
-        var packetArray = packetData.Array ?? throw new InvalidOperationException("Packet data array is null.");
-
-        UdpDatagramHeader? udpDatagramHeader = null;
-        if (ipPacket.PacketData.Count > 8)
-        {
-            udpDatagramHeader = new UdpDatagramHeader(
-              ParserHelpers.ReadNetOrderUShort(packetArray, packetData.Offset),
-              ParserHelpers.ReadNetOrderUShort(packetArray, packetData.Offset + 2),
-              ParserHelpers.ReadNetOrderUShort(packetArray, packetData.Offset + 4),
-              ParserHelpers.ReadNetOrderUShort(packetArray, packetData.Offset + 6));
-        }
-
-        ArraySegment<byte> udpData = reuseOriginalBuffer
-            ? new(packetArray[(packetData.Offset + 8)..])
-            : new(packetArray[(packetData.Offset + 8)..].ToArray());
-
-        var udpDatagram = new UdpDatagram
-        {
-            PacketHeader = ipPacket.PacketHeader,
-            UdpDatagramHeader = udpDatagramHeader,
-            UdpData = udpData,
-            ReceivedTime = ipPacket.ReceivedTime
-        };
-
-        return udpDatagram;
     }
 }
