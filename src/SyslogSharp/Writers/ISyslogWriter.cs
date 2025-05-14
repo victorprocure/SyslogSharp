@@ -2,5 +2,5 @@
 
 public interface ISyslogWriter
 {
-    Task WriteSyslogMessage(SyslogEventArgs syslogEventArgs);
+    Task WriteSyslogMessage(SyslogEvent syslogEventArgs);
 }
