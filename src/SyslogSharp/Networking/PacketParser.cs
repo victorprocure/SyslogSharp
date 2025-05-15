@@ -1,20 +1,6 @@
-﻿using System.Net.Sockets;
-
-using static SyslogSharp.Networking.ParserHelpers;
-
-namespace SyslogSharp.Networking;
+﻿namespace SyslogSharp.Networking;
 internal static class PacketParser
 {
-    public static IpPacket Parse(ArraySegment<byte> data)
-    {
-        if(data.Count == 0)
-        {
-            throw new ArgumentException("Data cannot be an empty collection", nameof(data));
-        }
-
-        return Parse(DateTimeOffset.UtcNow, true, data.Array, data.Offset);
-    }
-
     /// <summary>
     /// Parses a raw byte array representing an IPv4 packet into an <see cref="IpPacket"/> object.
     /// </summary>
@@ -28,14 +14,14 @@ internal static class PacketParser
     /// <returns>An <see cref="IpPacket"/> object containing the parsed packet data.</returns>
     /// <exception cref="ArgumentNullException">Thrown if <paramref name="packetBytes"/> is null.</exception>
     /// <exception cref="NotSupportedException">Thrown if the IP version is not IPv4.</exception>
-    public static IpPacket Parse(DateTimeOffset receivedTime, bool reuseBuffer, byte[]? packetBytes, int offset)
+    public static IpPacket Parse(DateTimeOffset receivedTime, Memory<byte> buffer)
     {
-        if(packetBytes is null)
+        if(buffer.IsEmpty)
         {
-            throw new ArgumentNullException(nameof(packetBytes), "Packet bytes cannot be null.");
+            throw new ArgumentNullException(nameof(buffer), "Packet bytes cannot be null.");
         }
 
-        var rawPacket = new RawIpPacket(new(packetBytes, offset, packetBytes.Length - offset));
+        var rawPacket = new RawIpPacket(buffer.ToArray(), receivedTime);
         if(rawPacket.PayloadPacketOrData.Value.AsT0 is IpPacket ipPacket)
         {
 

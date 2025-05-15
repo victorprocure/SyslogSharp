@@ -3,7 +3,9 @@ using System.Net.Sockets;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Logging;
 using System.Diagnostics.CodeAnalysis;
-using System.Collections.Concurrent;
+using System.Threading.Channels;
+using System.Diagnostics;
+using System.Buffers;
 
 namespace SyslogSharp.Networking;
 
@@ -17,11 +19,15 @@ namespace SyslogSharp.Networking;
 /// <typeparam name="T">The type of data parsed from received UDP packets.</typeparam>
 internal abstract class UdpReceiver<T> : IDisposable
 {
-    private Socket? _socket;
+    private readonly ArrayPool<byte> _bufferPool = ArrayPool<byte>.Shared;
+    private Socket _socket;
     private bool _disposed;
-    private ConcurrentQueue<SocketAsyncEventArgs>? _receiveDataProcessorsPool;
-    private readonly List<IDisposable> _disposables = [];
-    private readonly int _concurrentReceivers;
+    private CancellationTokenSource? _cts;
+    private SocketAsyncEventArgs? _receiveEventArgs;
+    private readonly Channel<Packet> _channel;
+    private readonly Stopwatch _stopWatch;
+    private long _messagesReceived;
+    private long _bytesReceived;
 
     /// <summary>
     /// Gets the endpoint on which the server is configured to listen for incoming connections.
@@ -57,13 +63,14 @@ internal abstract class UdpReceiver<T> : IDisposable
     /// specified endpoint. Ensure that the provided <paramref name="listenEndpoint"/> is valid and properly configured
     /// for UDP communication.</remarks>
     /// <param name="listenEndpoint">The <see cref="EndPoint"/> on which the receiver will listen for incoming UDP packets. Cannot be null.</param>
-    protected UdpReceiver(EndPoint listenEndpoint, int concurrentReceivers = 10)
+    protected UdpReceiver(EndPoint listenEndpoint, int socketBufferItems = default)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThan(concurrentReceivers, 1);
-
         ListenProtocol = System.Net.Sockets.ProtocolType.Udp;
         ListenEndpoint = listenEndpoint;
-        _concurrentReceivers = concurrentReceivers;
+        _socket = new Socket(AddressFamily.InterNetwork, SocketType.Raw, ListenProtocol);
+        _socket.Bind(ListenEndpoint);
+        _channel = socketBufferItems == default ? Channel.CreateUnbounded<Packet>() : Channel.CreateBounded<Packet>(socketBufferItems);
+        _stopWatch = new Stopwatch();
     }
 
     /// <summary>
@@ -73,34 +80,33 @@ internal abstract class UdpReceiver<T> : IDisposable
     /// <remarks>This method sets up the necessary resources for receiving data, including initializing the
     /// socket and event arguments. If the receiver is already initialized, the method logs a warning and exits without
     /// reinitializing.</remarks>
-    public void Start()
+    public virtual async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (_socket != null || _receiveDataProcessorsPool != null)
+        _stopWatch.Start();
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        var receiverTask = Task.Run(() => ReceiveDataAndProcess(_cts.Token), cancellationToken);
+        var processorTask = Task.Run(() => ProcessReceivedData(_cts.Token), cancellationToken);
+
+        await Task.WhenAll(receiverTask, processorTask);
+    }
+
+    public virtual async Task StopAsync()
+    {
+        _stopWatch.Stop();
+        var statistics = $@"
+****** Server Statistics ****
+Messages Received: {Interlocked.Read(ref _messagesReceived)}
+Bytes Received: {Interlocked.Read(ref _bytesReceived)}
+Elapsed Time: {_stopWatch.Elapsed}
+*******************************";
+        Logger.LogInformation("{Statistics}", statistics);
+
+        if (_cts is not null)
         {
-            Logger.LogWarning("Start called on an already initialized receiver.");
-            return;
+            await _cts.CancelAsync();
+            _socket.Close();
         }
-
-        _receiveDataProcessorsPool = new ConcurrentQueue<SocketAsyncEventArgs>();
-        var eventArgsHandler = new EventHandler<SocketAsyncEventArgs>(ReceiveCompletedHandler);
-
-        for(var i = 0; i < _concurrentReceivers; i++)
-        {
-            var eventArgs = new SocketAsyncEventArgs();
-            eventArgs.SetBuffer(new byte[ushort.MaxValue], 0, ushort.MaxValue);
-            eventArgs.Completed += eventArgsHandler;
-            _receiveDataProcessorsPool.Enqueue(eventArgs);
-            _disposables.Add(eventArgs);
-        }
-
-        _socket = new Socket(AddressFamily.InterNetwork, SocketType.Raw, System.Net.Sockets.ProtocolType.Udp)
-        {
-            ReceiveBufferSize = int.MaxValue
-        };
-
-        _socket.Bind(ListenEndpoint);
-
-        ReceiveDataAndProcess();
     }
 
     /// <summary>
@@ -115,60 +121,40 @@ internal abstract class UdpReceiver<T> : IDisposable
     /// langword="false"/>.</returns>
     protected abstract bool TryParsePacket(TransportPacket packet, [NotNullWhen(true)] out T? data);
 
-    private void ReceiveCompletedHandler(object? sender, SocketAsyncEventArgs e)
+    private async Task ProcessReceivedData(CancellationToken cancellationToken)
     {
         if (_disposed)
             return;
 
-        if (e.LastOperation == SocketAsyncOperation.Receive || e.LastOperation == SocketAsyncOperation.ReceiveFrom)
-            ProcessReceivedData(e);
-    }
-
-    private void ProcessReceivedData(SocketAsyncEventArgs e)
-    {
-        if (_disposed)
-            return;
-
-        if (e.Buffer is null)
+        await foreach(var ipPacket in _channel.Reader.ReadAllAsync(cancellationToken))
         {
-            Logger.LogError("Unable to process received data. Buffer is null.");
-            throw new InvalidOperationException("Buffer is null.");
-        }
-
-        var ipPacket = PacketParser.Parse(DateTimeOffset.UtcNow, false, e.Buffer, 0);
-        var payload = ipPacket.PayloadPacketOrData.Value.AsT0;
-
-        if (e.SocketError == SocketError.Success && payload is TransportPacket transportPacket && TryParsePacket(transportPacket, out var packet))
-        {
-            Received?.Invoke(this, packet!);
-        }
-
-        e.SetBuffer(0, ushort.MaxValue);
-        _receiveDataProcessorsPool?.Enqueue(e);
-        ReceiveDataAndProcess();
-    }
-
-    private void ReceiveDataAndProcess()
-    {
-        if (_disposed)
-            return;
-
-        if (_socket is null || _receiveDataProcessorsPool is null)
-        {
-            Logger.LogError("Receiver not initialized correctly.");
-            throw new InvalidOperationException("Receiver not initialized correctly.");
-        }
-
-        if(_receiveDataProcessorsPool.TryDequeue(out var deqAsyncEvent))
-        {
-            if(deqAsyncEvent.Offset != 0 || deqAsyncEvent.Count != ushort.MaxValue)
+            if (!ipPacket.PayloadPacketOrData.Value.TryPickT0(out var tp, out var _) || tp is not TransportPacket transportPacket)
             {
-                deqAsyncEvent.SetBuffer(new byte[ushort.MaxValue], 0, ushort.MaxValue);
+                Logger.LogError("Unable to process received data. Payload is not a transport packet.");
+                throw new InvalidOperationException("Payload is not a transport packet.");
             }
 
-            if(!_socket.ReceiveAsync(deqAsyncEvent))
-                ProcessReceivedData(deqAsyncEvent);
+            if(TryParsePacket(transportPacket, out var packet))
+            {
+                Received?.Invoke(this, packet!);
+            }
         }
+    }
+
+    private async Task ReceiveDataAndProcess(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var buffer = _bufferPool.Rent(8192);
+            var result = await _socket.ReceiveFromAsync(buffer, SocketFlags.None, ListenEndpoint, cancellationToken);
+            var packet = PacketParser.Parse(DateTimeOffset.UtcNow, buffer.AsMemory()[..result.ReceivedBytes]);
+            await _channel.Writer.WriteAsync(packet, cancellationToken);
+            _bufferPool.Return(buffer);
+            Interlocked.Increment(ref _messagesReceived);
+            Interlocked.Add(ref _bytesReceived, result.ReceivedBytes);
+        }
+
+        _channel.Writer.Complete();
     }
 
     /// <summary>
@@ -197,15 +183,15 @@ internal abstract class UdpReceiver<T> : IDisposable
         finally
         {
             _socket?.Dispose();
-            _socket = null;
+            _socket = null!;
         }
 
         try
         {
-            foreach(var disposable in _disposables)
-            {
-                disposable.Dispose();
-            }
+            _receiveEventArgs?.Dispose();
+            _receiveEventArgs = null;
+
+            _cts?.Dispose();
         }
         catch
         {

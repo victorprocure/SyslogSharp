@@ -1,6 +1,5 @@
 ﻿using System.Diagnostics.CodeAnalysis;
 using System.Net;
-using System.Net.Sockets;
 
 using Microsoft.Extensions.Logging;
 
@@ -15,14 +14,6 @@ internal sealed class UdpServer : UdpReceiver<SyslogMessage>
     public UdpServer(IPEndPoint endPoint) : this(endPoint as EndPoint) { }
     private UdpServer(EndPoint endPoint) : base(endPoint)
     {
-    }
-
-    public Task StartAsync(CancellationToken _)
-    {
-        Logger.LogInformation("Starting syslog UDP server...");
-
-        Start();
-        return Task.CompletedTask;
     }
 
     protected override bool TryParsePacket(TransportPacket packet, [NotNullWhen(true)] out SyslogMessage? data)

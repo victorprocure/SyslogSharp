@@ -30,5 +30,5 @@ await Parser.Default.ParseArguments<ConsoleOptions>(args)
             }
         }
 
-        await server.StopServerAsync(CancellationToken.None);
+        await server.StopServerAsync();
     });

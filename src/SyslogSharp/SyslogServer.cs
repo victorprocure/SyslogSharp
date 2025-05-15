@@ -38,13 +38,14 @@ internal sealed class SyslogServer : IDisposable
         await StartListenerAsync(settings, _stoppingCts.Token);
     }
 
-    public Task StopServerAsync(CancellationToken cancellationToken)
+    public async Task StopServerAsync()
     {
         try
         {
-            _stoppingCts!.Cancel();
+            await _stoppingCts!.CancelAsync();
             if (_udpServer is not null)
             {
+                await _udpServer.StopAsync();
                 _udpServer.Received -= OnSyslogMessageReceived;
                 _udpServer?.Dispose();
                 _udpServer = null;
@@ -54,8 +55,6 @@ internal sealed class SyslogServer : IDisposable
         {
             // Ignore exceptions during shutdown
         }
-
-        return Task.CompletedTask;
     }
 
     private async Task StartListenerAsync(SyslogSettings settings, CancellationToken cancellationToken)
